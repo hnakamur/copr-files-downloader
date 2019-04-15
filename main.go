@@ -17,13 +17,14 @@ import (
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
+	"github.com/vbauerster/mpb"
+	"github.com/vbauerster/mpb/decor"
 )
 
 func main() {
 	destDir := flag.String("dest", "", "destination directory")
 	user := flag.String("user", "", "user name")
 	repo := flag.String("repo", "", "repository name")
-	c := flag.Int("c", 6, "download concurrency")
 	timeout := flag.Duration("timeout", time.Minute, "http client timeout")
 	flag.Parse()
 
@@ -39,7 +40,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	err = downloadFiles(*c, fileURLs, *timeout, *destDir)
+	err = downloadFiles(fileURLs, *timeout, *destDir)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -134,7 +135,7 @@ func getRPMFileURLs(indexURLs []*url.URL) ([]string, error) {
 	return fileURLs, nil
 }
 
-func downloadFiles(concurrency int, fileURLs []string, timeout time.Duration, destDir string) error {
+func downloadFiles(fileURLs []string, timeout time.Duration, destDir string) error {
 	if destDir == "" {
 		var err error
 		destDir, err = ioutil.TempDir("", "ppa")
@@ -149,42 +150,48 @@ func downloadFiles(concurrency int, fileURLs []string, timeout time.Duration, de
 	}
 
 	var wg sync.WaitGroup
-	jobs := make(chan string)
-	for i := 0; i < concurrency; i++ {
-		wg.Add(1)
+	p := mpb.New(mpb.WithWaitGroup(&wg))
+
+	wg.Add(len(fileURLs))
+	for _, fileURL := range fileURLs {
+		fileURL := fileURL
+
 		go func() {
 			defer wg.Done()
 
 			client := http.Client{Timeout: timeout}
-			for job := range jobs {
-				log.Printf("downloading %s", job)
-				base := path.Base(job)
-				destFile := filepath.Join(destDir, base)
-				file, err := os.Create(destFile)
-				if err != nil {
-					log.Println(err)
-				}
-				defer file.Close()
+			base := path.Base(fileURL)
+			destFile := filepath.Join(destDir, base)
+			file, err := os.Create(destFile)
+			if err != nil {
+				log.Println(err)
+			}
+			defer file.Close()
 
-				resp, err := client.Get(job)
-				if err != nil {
-					log.Println(err)
-				}
-				defer resp.Body.Close()
-				_, err = io.Copy(file, resp.Body)
-				if err != nil {
-					log.Println(err)
-				}
-				log.Printf("downloaded  %s", job)
+			resp, err := client.Get(fileURL)
+			if err != nil {
+				log.Println(err)
+			}
+			defer resp.Body.Close()
+
+			contentLength := resp.ContentLength
+
+			bar := p.AddBar(contentLength,
+				mpb.PrependDecorators(
+					decor.Name(base),
+				),
+				mpb.AppendDecorators(
+					decor.Percentage(decor.WCSyncSpace),
+				),
+			)
+
+			_, err = io.Copy(file, bar.ProxyReader(resp.Body))
+			if err != nil {
+				log.Println(err)
 			}
 		}()
 	}
-
-	for _, fileURL := range fileURLs {
-		jobs <- fileURL
-	}
-	close(jobs)
-	wg.Wait()
+	p.Wait()
 	log.Printf("downloaded files to %s", destDir)
 	return nil
 }
